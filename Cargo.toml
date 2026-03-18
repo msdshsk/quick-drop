@@ -1,0 +1,17 @@
+[package]
+name = "quickdrop"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+anyhow = "1.0"
+chrono = "0.4"
+eframe = "0.29"
+egui = "0.29"
+rfd = "0.15"
+
+[build-dependencies]
+winres = "0.1"
