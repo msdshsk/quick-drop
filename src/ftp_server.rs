@@ -46,9 +46,9 @@ impl Session {
         }
     }
 
+    /// 仮想FTPパスを実ファイルシステムパスに変換する。
+    /// ".." による親ディレクトリ移動は許可するが、root_dir の外には出られない。
     fn get_real_path(&self, virtual_path: &Path) -> Result<PathBuf> {
-        eprintln!("[DEBUG] get_real_path: virtual_path={:?}, root_dir={:?}", virtual_path, self.root_dir);
-
         // 仮想パスを文字列として処理
         let virtual_path_str = virtual_path.to_string_lossy();
 
@@ -59,76 +59,45 @@ impl Session {
             virtual_path_str.as_ref()
         };
 
-        eprintln!("[DEBUG] get_real_path: cleaned_str={:?}", cleaned_str);
-
-        // 空のパスの場合はルートディレクトリをそのまま返す（既に正規化済み）
+        // 空のパスの場合はルートディレクトリをそのまま返す
         if cleaned_str.is_empty() {
-            eprintln!("[DEBUG] get_real_path: empty path, returning={:?}", self.root_dir);
             return Ok(self.root_dir.clone());
         }
 
-        let cleaned_path = Path::new(cleaned_str);
-        eprintln!("[DEBUG] get_real_path: cleaned_path={:?}", cleaned_path);
-
         // ルートディレクトリと結合
-        let full_path = self.root_dir.join(cleaned_path);
-        eprintln!("[DEBUG] get_real_path: full_path={:?}", full_path);
+        let full_path = self.root_dir.join(cleaned_str);
 
-        // セキュリティチェック: パストラバーサルを防ぐ
-        // 文字列に".."が含まれていないか確認
-        if cleaned_str.contains("..") {
-            eprintln!("[ERROR] get_real_path: parent directory access attempted");
-            return Err(anyhow::anyhow!("Access denied: parent directory access not allowed"));
-        }
-
-        // full_pathがルートディレクトリ配下にあることを確認
-        // 両方を正規化して比較
+        // パスを正規化して実際の場所を解決（".." もここで解決される）
         let canonical_full = if full_path.exists() {
-            eprintln!("[DEBUG] get_real_path: full_path exists, canonicalizing");
             let canonical = full_path.canonicalize()?;
             normalize_path(&canonical)
         } else {
-            eprintln!("[DEBUG] get_real_path: full_path does not exist");
             // 存在しない場合は親ディレクトリを正規化してファイル名を追加
             if let Some(parent) = full_path.parent() {
-                eprintln!("[DEBUG] get_real_path: parent={:?}", parent);
                 if parent.exists() {
                     let canonical_parent = normalize_path(&parent.canonicalize()?);
-                    eprintln!("[DEBUG] get_real_path: canonical_parent={:?}", canonical_parent);
                     if let Some(file_name) = full_path.file_name() {
                         canonical_parent.join(file_name)
                     } else {
                         canonical_parent
                     }
                 } else {
-                    // 親が存在しない場合はエラー
-                    eprintln!("[ERROR] get_real_path: parent directory does not exist");
                     return Err(anyhow::anyhow!("Parent directory does not exist"));
                 }
             } else {
                 full_path
             }
         };
-        eprintln!("[DEBUG] get_real_path: canonical_full={:?}", canonical_full);
 
-        // ルートディレクトリと比較（root_dirは既に正規化済み）
-        eprintln!("[DEBUG] get_real_path: root_dir={:?}", self.root_dir);
-
-        // Windowsでは大文字小文字を無視して比較する必要がある
+        // セキュリティチェック: 正規化後のパスがルートディレクトリ配下にあることを確認
+        // Windowsでは大文字小文字を無視して比較
         let canonical_full_str = canonical_full.to_string_lossy().to_lowercase();
         let root_dir_str = self.root_dir.to_string_lossy().to_lowercase();
 
-        eprintln!("[DEBUG] get_real_path: canonical_full_str={}", canonical_full_str);
-        eprintln!("[DEBUG] get_real_path: root_dir_str={}", root_dir_str);
-
         if !canonical_full_str.starts_with(&root_dir_str) {
-            eprintln!("[ERROR] get_real_path: path outside root directory");
-            eprintln!("[ERROR]   canonical_full={:?} (lowercase: {})", canonical_full, canonical_full_str);
-            eprintln!("[ERROR]   root_dir={:?} (lowercase: {})", self.root_dir, root_dir_str);
             return Err(anyhow::anyhow!("Access denied: path outside root directory"));
         }
 
-        eprintln!("[DEBUG] get_real_path: success, returning={:?}", canonical_full);
         Ok(canonical_full)
     }
 }
@@ -275,16 +244,22 @@ async fn handle_command(
             }
 
             if let Some(listener) = sess.pasv_listener.take() {
-                let _ = log_tx.send(format!("[DEBUG] LIST: current_dir={:?}, root_dir={:?}",
-                    sess.current_dir, sess.root_dir));
+                // LIST引数がある場合はそのパス、なければcurrent_dirを使用
+                // "-la" 等のオプション引数は無視する
+                let list_dir = match arg {
+                    Some(a) if !a.is_empty() && !a.starts_with('-') => {
+                        if a.starts_with('/') {
+                            PathBuf::from(a)
+                        } else {
+                            sess.current_dir.join(a)
+                        }
+                    }
+                    _ => sess.current_dir.clone(),
+                };
 
-                let real_path = match sess.get_real_path(&sess.current_dir) {
-                    Ok(path) => {
-                        let _ = log_tx.send(format!("[DEBUG] LIST: real_path={:?}", path));
-                        path
-                    },
-                    Err(e) => {
-                        let _ = log_tx.send(format!("[ERROR] LIST: get_real_path failed: {}", e));
+                let real_path = match sess.get_real_path(&list_dir) {
+                    Ok(path) => path,
+                    Err(_) => {
                         return Ok("550 Failed to access directory\r\n".to_string());
                     },
                 };
