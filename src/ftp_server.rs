@@ -228,7 +228,8 @@ async fn handle_command(
             if !sess.authenticated {
                 return Ok("530 Please login with USER and PASS\r\n".to_string());
             }
-            Ok(format!("257 \"/\" is current directory\r\n"))
+            let cwd = sess.current_dir.to_string_lossy().replace('\\', "/");
+            Ok(format!("257 \"{}\" is current directory\r\n", cwd))
         }
         "TYPE" => {
             let sess = session.lock().await;
@@ -332,7 +333,12 @@ async fn handle_command(
             }
 
             let filename = arg.unwrap_or("");
-            let file_path = match sess.get_real_path(Path::new(filename)) {
+            let virtual_path = if filename.starts_with('/') {
+                PathBuf::from(filename)
+            } else {
+                sess.current_dir.join(filename)
+            };
+            let file_path = match sess.get_real_path(&virtual_path) {
                 Ok(path) => path,
                 Err(_) => return Ok("550 File not accessible\r\n".to_string()),
             };
@@ -364,7 +370,12 @@ async fn handle_command(
             }
 
             let filename = arg.unwrap_or("");
-            let file_path = match sess.get_real_path(Path::new(filename)) {
+            let virtual_path = if filename.starts_with('/') {
+                PathBuf::from(filename)
+            } else {
+                sess.current_dir.join(filename)
+            };
+            let file_path = match sess.get_real_path(&virtual_path) {
                 Ok(path) => path,
                 Err(_) => return Ok("550 File not accessible\r\n".to_string()),
             };
@@ -390,11 +401,63 @@ async fn handle_command(
             }
         }
         "CWD" => {
-            let sess = session.lock().await;
+            let mut sess = session.lock().await;
             if !sess.authenticated {
                 return Ok("530 Please login with USER and PASS\r\n".to_string());
             }
-            Ok("250 Directory changed to /\r\n".to_string())
+
+            let target = arg.unwrap_or("/");
+
+            // 仮想パスを構築
+            let new_dir = if target.starts_with('/') {
+                PathBuf::from(target)
+            } else {
+                sess.current_dir.join(target)
+            };
+
+            // 実パスに変換して存在確認
+            match sess.get_real_path(&new_dir) {
+                Ok(real_path) => {
+                    if real_path.is_dir() {
+                        // root_dirからの相対パスを仮想パスとして保持
+                        let root_str = sess.root_dir.to_string_lossy().to_lowercase();
+                        let real_str = real_path.to_string_lossy().to_lowercase();
+                        let relative = if real_str == root_str {
+                            "/".to_string()
+                        } else {
+                            let rel = &real_path.to_string_lossy()[sess.root_dir.to_string_lossy().len()..];
+                            let rel = rel.replace('\\', "/");
+                            if rel.starts_with('/') { rel } else { format!("/{}", rel) }
+                        };
+                        sess.current_dir = PathBuf::from(&relative);
+                        Ok(format!("250 Directory changed to {}\r\n", relative))
+                    } else {
+                        Ok("550 Not a directory\r\n".to_string())
+                    }
+                }
+                Err(_) => Ok("550 Directory not found\r\n".to_string()),
+            }
+        }
+        "CDUP" => {
+            let mut sess = session.lock().await;
+            if !sess.authenticated {
+                return Ok("530 Please login with USER and PASS\r\n".to_string());
+            }
+
+            let parent = sess.current_dir.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("/"));
+
+            // ルートより上には行かせない
+            let parent_str = parent.to_string_lossy().replace('\\', "/");
+            if parent_str.is_empty() {
+                sess.current_dir = PathBuf::from("/");
+            } else {
+                sess.current_dir = parent;
+            }
+
+            let cwd = sess.current_dir.to_string_lossy().replace('\\', "/");
+            Ok(format!("250 Directory changed to {}\r\n", cwd))
         }
         "MKD" | "XMKD" => {
             let sess = session.lock().await;
@@ -494,6 +557,33 @@ async fn handle_command(
                     let _ = log_tx.send(format!("[{}] ファイル削除失敗: {} - {}", peer_addr, filename, e));
                     Ok(format!("550 Failed to delete file: {}\r\n", e))
                 }
+            }
+        }
+        "SIZE" => {
+            let sess = session.lock().await;
+            if !sess.authenticated {
+                return Ok("530 Please login with USER and PASS\r\n".to_string());
+            }
+
+            let filename = match arg {
+                Some(f) if !f.is_empty() => f,
+                _ => return Ok("501 Missing file name\r\n".to_string()),
+            };
+
+            let virtual_path = if filename.starts_with('/') {
+                PathBuf::from(filename)
+            } else {
+                sess.current_dir.join(filename)
+            };
+
+            match sess.get_real_path(&virtual_path) {
+                Ok(real_path) => {
+                    match fs::metadata(&real_path) {
+                        Ok(meta) => Ok(format!("213 {}\r\n", meta.len())),
+                        Err(_) => Ok("550 File not found\r\n".to_string()),
+                    }
+                }
+                Err(_) => Ok("550 File not found\r\n".to_string()),
             }
         }
         "QUIT" => Ok("221 Goodbye\r\n".to_string()),
